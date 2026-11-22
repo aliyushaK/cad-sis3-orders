@@ -1,0 +1,72 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write          # required for OIDC
+  contents: read
+
+env:
+  AWS_REGION: eu-north-1
+  STACK_NAME: sis3-orders
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests
+        run: |
+          pip install -q -r app/requirements.txt
+          cd app && python -m unittest -v
+      - name: Lint CloudFormation templates
+        run: |
+          pip install -q cfn-lint
+          cfn-lint --non-zero-exit-code error infra/app.yaml infra/ecr.yaml infra/github-oidc.yaml
+
+  deploy:
+    needs: test            # no AWS credentials unless the tests passed
+    runs-on: ubuntu-latest
+    environment: production  # sub becomes ...:environment:production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get temporary AWS credentials (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build and push image tagged with the commit SHA
+        run: |
+          REPO=${{ vars.ECR_REPO }}
+          aws ecr get-login-password | docker login -u AWS --password-stdin ${REPO%%/*}
+          docker build -t $REPO:$GITHUB_SHA .
+          docker push $REPO:$GITHUB_SHA
+
+      - name: Deploy the SIS 3 stack with the new tag
+        run: |
+          aws cloudformation deploy --stack-name $STACK_NAME \
+            --template-file infra/app.yaml \
+            --parameter-overrides Env=dev ImageTag=$GITHUB_SHA \
+            --role-arn ${{ vars.CFN_ROLE_ARN }} \
+            --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset
+
+      - name: Evidence - task definition revision and smoke test
+        run: |
+          OUT() { aws cloudformation describe-stacks --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          CLUSTER=$(OUT ClusterName); SERVICE=$(OUT ServiceName); URL=$(OUT ServiceUrl)
+          TD=$(aws ecs describe-services --cluster $CLUSTER --services $SERVICE \
+            --query "services[0].taskDefinition" --output text)
+          echo "Task definition now running: $TD"
+          aws ecs describe-task-definition --task-definition $TD \
+            --query "taskDefinition.containerDefinitions[0].image" --output text
+          curl -fsS $URL/health | tee health.json
+          grep -q "$GITHUB_SHA" health.json && echo "Smoke test OK: the service runs commit $GITHUB_SHA"
