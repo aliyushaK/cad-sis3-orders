@@ -39,7 +39,7 @@ def build_event(body):
         qty = int(body.get("qty", 1))
     except (TypeError, ValueError):
         raise ValueError("qty must be a number")
-    if qty < 0 or qty > 100:  # BUG on purpose: qty 0 is accepted
+    if qty < 1 or qty > 100:
         raise ValueError("qty must be between 1 and 100")
     # orderId is the deduplication key: a client that retries sends the same id
     order_id = str(body.get("orderId") or uuid.uuid4())[:64]
