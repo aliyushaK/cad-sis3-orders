@@ -60,6 +60,28 @@ curl -X POST $URL/orders -H 'Content-Type: application/json' -d '{"orderId":"ord
 
 Sending the same `orderId` twice stores the order once (the consumer logs `duplicate-skipped`).
 
+## CI/CD (Practice 7)
+
+`.github/workflows/deploy.yml` runs on every push to `main`:
+
+1. **test** — unit tests + `cfn-lint` (no AWS credentials yet)
+2. **deploy** (GitHub Environment `production`) — gets 1-hour AWS credentials through **OIDC**
+   (role from `infra/github-oidc.yaml`, no access keys stored anywhere), builds the image tagged with
+   `$GITHUB_SHA`, pushes it to ECR and runs `aws cloudformation deploy` with `ImageTag=$GITHUB_SHA`.
+
+Environment variables in GitHub (not secrets): `DEPLOY_ROLE_ARN`, `CFN_ROLE_ARN`, `ECR_REPO`.
+
+## Redeploy before the defence (after teardown)
+
+In CloudShell (eu-north-1):
+
+```bash
+git clone https://github.com/aliyushaK/cad-sis3-orders.git && cd cad-sis3-orders
+aws cloudformation deploy --stack-name sis3-registry --template-file infra/ecr.yaml --capabilities CAPABILITY_IAM
+```
+
+Then in GitHub → Actions → **deploy** → **Run workflow** — the pipeline builds the image and creates `sis3-orders`.
+
 ## Clean up
 
 ```bash
