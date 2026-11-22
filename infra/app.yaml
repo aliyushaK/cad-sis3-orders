@@ -1,0 +1,380 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SIS 3 - orders system. Can be deployed many times under different stack names.
+  ALB -> ECS Fargate API -> SNS topic -> SQS queue (+DLQ) -> idempotent Lambda -> DynamoDB.
+
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment - selects sizes from the Sizing mapping
+  ImageTag:
+    Type: String
+    AllowedPattern: "^[0-9a-f]{40}$"
+    Description: Git commit SHA of the image (never "latest")
+  ImageRepositoryName:
+    Type: String
+    Default: cad-sis3-orders
+    Description: ECR repository created by infra/ecr.yaml
+
+Mappings:
+  Sizing:
+    dev:     { Cpu: "256", Memory: "512",  Count: 1, LogDays: 7 }
+    staging: { Cpu: "512", Memory: "1024", Count: 2, LogDays: 14 }
+    prod:    { Cpu: "512", Memory: "1024", Count: 2, LogDays: 30 }
+
+Resources:
+  # ---------------- Network: VPC with two public subnets, no NAT ----------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-a" }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------- Security groups ----------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP to the load balancer only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Tasks accept traffic only from the ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSecurityGroup }
+
+  # ---------------- Load balancer ----------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref TargetGroup }
+
+  # ---------------- Messaging: SNS -> SQS (+ DLQ) ----------------
+  OrdersTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: OrderPlaced events
+
+  OrdersDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600       # 14 days to investigate failures
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60                 # > Lambda timeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDeadLetterQueue.Arn
+        maxReceiveCount: 3                  # after 3 failed tries -> DLQ
+
+  OrdersQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref OrdersQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrdersQueue.Arn
+            Condition:
+              ArnEquals: { aws:SourceArn: !Ref OrdersTopic }
+
+  OrdersSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrdersTopic
+      Protocol: sqs
+      Endpoint: !GetAtt OrdersQueue.Arn
+      RawMessageDelivery: true
+
+  # ---------------- Idempotent consumer: Lambda + DynamoDB ----------------
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: orderId, AttributeType: S }]
+      KeySchema: [{ AttributeName: orderId, KeyType: HASH }]
+
+  ConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-consumer
+      RetentionInDays: !FindInMap [Sizing, !Ref Env, LogDays]
+
+  ConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: consume-orders
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ConsumerLogGroup.Arn
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt OrdersQueue.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt OrdersTable.Arn
+
+  ConsumerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ConsumerLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-consumer
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt ConsumerRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+      Code:
+        ZipFile: |
+          import json, os
+          import boto3
+          from botocore.exceptions import ClientError
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+
+          def handler(event, context):
+              failures = []
+              for record in event["Records"]:
+                  order_id = None
+                  try:
+                      order = json.loads(record["body"])
+                      order_id = order["orderId"]          # deduplication key
+                      table.put_item(
+                          Item={"orderId": order_id, "item": order["item"],
+                                "qty": int(order["qty"]), "messageId": record["messageId"]},
+                          # only the FIRST copy of an order is written
+                          ConditionExpression="attribute_not_exists(orderId)",
+                      )
+                      print(json.dumps({"result": "stored", "orderId": order_id}))
+                  except ClientError as err:
+                      if err.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                          print(json.dumps({"result": "duplicate-skipped", "orderId": order_id}))
+                      else:
+                          print(json.dumps({"result": "failed", "error": str(err)}))
+                          failures.append({"itemIdentifier": record["messageId"]})
+                  except Exception as err:             # bad message -> retry -> DLQ
+                      print(json.dumps({"result": "failed", "error": str(err)}))
+                      failures.append({"itemIdentifier": record["messageId"]})
+              return {"batchItemFailures": failures}
+
+  ConsumerEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref ConsumerFunction
+      EventSourceArn: !GetAtt OrdersQueue.Arn
+      BatchSize: 10
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # ---------------- ECS Fargate service ----------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings: [{ Name: containerInsights, Value: disabled }]
+
+  ServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${AWS::StackName}
+      RetentionInDays: !FindInMap [Sizing, !Ref Env, LogDays]
+
+  # Role 1: used by the ECS agent to pull the image and write logs
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # Role 2: used by the application code - may only publish to its own topic
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: publish-orders
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref OrdersTopic
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-api
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !FindInMap [Sizing, !Ref Env, Cpu]
+      Memory: !FindInMap [Sizing, !Ref Env, Memory]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: web
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ImageRepositoryName}:${ImageTag}
+          Essential: true
+          PortMappings: [{ ContainerPort: 8080, Protocol: tcp }]
+          Environment:
+            - { Name: TOPIC_ARN, Value: !Ref OrdersTopic }
+            - { Name: APP_VERSION, Value: !Ref ImageTag }
+            - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ServiceLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !FindInMap [Sizing, !Ref Env, Count]
+      TaskDefinition: !Ref TaskDefinition
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED            # needed to pull from ECR without a NAT
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+      LoadBalancers:
+        - ContainerName: web
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  ServiceUrl:
+    Description: Open this in the browser
+    Value: !Sub http://${LoadBalancer.DNSName}
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  TopicArn:
+    Value: !Ref OrdersTopic
+  QueueUrl:
+    Value: !Ref OrdersQueue
+  DeadLetterQueueUrl:
+    Value: !Ref OrdersDeadLetterQueue
+  TableName:
+    Value: !Ref OrdersTable
+  ImageInUse:
+    Value: !Sub ${ImageRepositoryName}:${ImageTag}

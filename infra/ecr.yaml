@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SIS 3 - shared image registry. Deployed ONCE per account.
+  ECR repository (immutable tags, scan on push, lifecycle policy) and a
+  CodeBuild project that builds the image from GitHub and tags it with the commit SHA.
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Default: cad-sis3-orders
+  SourceRepoUrl:
+    Type: String
+    Default: https://github.com/aliyushaK/cad-sis3-orders.git
+    Description: Public GitHub repository with the Dockerfile
+
+Resources:
+  ImageRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      ImageTagMutability: IMMUTABLE          # a tag can never be overwritten
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EmptyOnDelete: true                    # lets delete-stack remove the repo
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /codebuild/${AWS::StackName}-image-build
+      RetentionInDays: 7
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build-and-push
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt BuildLogGroup.Arn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken      # cannot be scoped to a repo
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                Resource: !GetAtt ImageRepository.Arn
+
+  ImageBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-image-build
+      Description: Clones the repo, runs unit tests, builds and pushes image:<commit SHA>
+      ServiceRole: !GetAtt BuildRole.Arn
+      Artifacts: { Type: NO_ARTIFACTS }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        PrivilegedMode: true                 # required for docker build
+        EnvironmentVariables:
+          - Name: REPOSITORY_URI
+            Value: !GetAtt ImageRepository.RepositoryUri
+          - Name: SOURCE_REPO
+            Value: !Ref SourceRepoUrl
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+      TimeoutInMinutes: 15
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          env:
+            shell: bash
+          phases:
+            build:
+              commands:
+                - git clone "$SOURCE_REPO" src
+                - cd src
+                - IMAGE_TAG=$(git rev-parse HEAD)
+                - echo "Building image tag $IMAGE_TAG"
+                - pip install -q -r app/requirements.txt
+                - (cd app && python -m unittest -v)
+                - aws ecr get-login-password | docker login -u AWS --password-stdin "${REPOSITORY_URI%%/*}"
+                - docker build -t "$REPOSITORY_URI:$IMAGE_TAG" .
+                - docker push "$REPOSITORY_URI:$IMAGE_TAG"
+                - echo "PUSHED $REPOSITORY_URI:$IMAGE_TAG"
+
+Outputs:
+  RepositoryUri:
+    Value: !GetAtt ImageRepository.RepositoryUri
+  RepositoryName:
+    Value: !Ref ImageRepository
+  BuildProject:
+    Value: !Ref ImageBuild
